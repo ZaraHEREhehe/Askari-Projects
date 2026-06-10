@@ -1,0 +1,6 @@
+Thumbs.db
+__pycache__/
+*.pyc
+checkpoints/
+plots/
+*.pt
