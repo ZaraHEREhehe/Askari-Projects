@@ -21,6 +21,7 @@ import random
 
 import numpy as np
 import torch
+import torchvision.transforms as T
 from torch.utils.data import Dataset, Sampler
 
 from preprocess import preprocess_signature
@@ -96,8 +97,9 @@ class CEDARImageDataset(Dataset):
     is_genuine   : int  (1 = genuine, 0 = forgery)
     """
 
-    def __init__(self, cache_dir: str, writers: list):
+    def __init__(self, cache_dir: str, writers: list, augment: bool = False):
         self.cache_dir = cache_dir
+        self.augment   = augment
         self.items     = []          # (npy_path, writer_id, is_genuine)
 
         for wid in writers:
@@ -118,6 +120,18 @@ class CEDARImageDataset(Dataset):
             else:
                 self.forgery_by_writer.setdefault(wid, []).append(idx)
 
+        # Build augmentation pipeline (training only; None when augment=False).
+        # Applied in [0,1] float space BEFORE ImageNet normalisation so that
+        # brightness/contrast jitter operates in the natural pixel range.
+        self._aug = T.Compose([
+            T.RandomRotation(degrees=10, fill=1.0),
+            T.RandomAffine(degrees=0, scale=(0.9, 1.1), fill=1.0),
+            T.RandomPerspective(distortion_scale=0.1, p=0.5, fill=1.0),
+            T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
+            T.RandomErasing(p=0.5, scale=(0.02, 0.08), value=1.0),
+        ]) if augment else None
+
     def __len__(self) -> int:
         return len(self.items)
 
@@ -125,8 +139,10 @@ class CEDARImageDataset(Dataset):
         path, writer_id, is_genuine = self.items[idx]
         arr = np.load(path)                                      # uint8 (224, 224)
         img = torch.from_numpy(arr.astype(np.float32) / 255.0)  # float32 [0, 1]
-        img = (img - IMAGENET_MEAN) / IMAGENET_STD               # ImageNet normalise
         img = img.unsqueeze(0)                                   # (1, 224, 224)
+        if self._aug is not None:
+            img = self._aug(img)
+        img = (img - IMAGENET_MEAN) / IMAGENET_STD               # ImageNet normalise
         return img, writer_id, is_genuine
 
 

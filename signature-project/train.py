@@ -42,51 +42,64 @@ from model   import SiameseNetwork
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-LEARNING_RATE         = 1e-4
-NUM_EPOCHS            = 10
-MARGIN                = 0.3   # cosine-distance triplet margin; tighter than the old 0.5
+LEARNING_RATE         = 1e-5   # backbone (layer4) — 10x smaller than before to slow overfitting
+LR_FC                 = 1e-4   # embedding head (fc) — higher LR, fewer params
+NUM_EPOCHS            = 30
+MARGIN                = 0.5   # cosine-distance margin; 0.3 was satisfied in one epoch
+                               # (forgeries start at d≈0.35, need to reach d>0.65)
 EMBEDDING_DIM         = 128
 SEED                  = 42
 
 P                     = 16    # writers sampled per batch
 K_GENUINE             = 4     # genuine images per writer per batch
 K_FORGERY             = 4     # forgery images per writer per batch
-# ~94 batches x 16 writers x 4 genuine anchors ≈ 6 000 triplets/epoch
+# All-pairs loss: 94 batches x 16 writers x 4 anchors x 4 forgeries ≈ 24 000 triplets/epoch
 NUM_BATCHES_PER_EPOCH = 94
 
-LR_DECAY_EPOCH        = 5     # LR halved after this epoch (effect from epoch 6)
+LR_DECAY_EPOCH        = 15    # LR halved after this epoch (midpoint of 30-epoch run)
 LR_DECAY_FACTOR       = 0.5
 
 CHECKPOINT_DIR        = "checkpoints"
 CACHE_DIR             = "cache"
-NUM_WORKERS           = 4     # set to 0 if multiprocessing causes issues on Windows
+NUM_WORKERS           = 0     # 0 = safe on Windows; set to 4 on Linux/Colab for speed
 
 
 # ---------------------------------------------------------------------------
-# Triplet loss — online semi-hard negative mining
+# Triplet loss — all-pairs, same-writer forgeries only
 # ---------------------------------------------------------------------------
 
-def triplet_loss_semihard(
+def triplet_loss_allpairs(
     embeddings: torch.Tensor,
     writer_ids,
     is_genuine,
-    margin: float = 0.3,
+    margin: float = 0.5,
 ) -> tuple:
     """
-    Vectorised online semi-hard negative mining.
+    All-pairs triplet loss using same-writer forgeries as the ONLY negatives.
 
-    anchor   = genuine image i
-    positive = same-writer genuine j (hardest: max cosine distance from anchor)
-    negative = same-writer skilled forgery k  (primary — the actual threat)
-               OR different-writer genuine k  (secondary — easy regulariser)
-               Selection: semi-hard (pos_dist < neg_dist < pos_dist + margin).
-               Fallback: closest valid negative when no semi-hard exists.
+    For every (anchor_i, forgery_k) pair where anchor_i is a genuine image
+    and forgery_k is a skilled forgery of the SAME writer:
 
-    Using same-writer forgeries as the primary negative pool forces the model to
-    learn features that separate a writer's own genuine from their own forgeries,
-    not just features that separate different writers from each other.
+        loss[i,k] = max(0, d_hardest_pos[i] - dist[i,k] + margin)
 
-    Returns (loss_scalar, n_valid_triplets)
+    d_hardest_pos[i] = distance to the furthest same-writer genuine (hardest
+    positive), giving the most conservative anchor-positive distance.
+
+    Why all-pairs instead of one-per-anchor:
+      One-per-anchor mining picks the closest violating forgery.  Once that
+      forgery crosses the margin, the anchor contributes 0 loss even if the
+      remaining K_forgery-1 forgeries are still within margin.  All-pairs
+      computes loss for EVERY forgery in the batch, so the model must push
+      ALL of them past margin before this anchor goes quiet.
+
+    Why no cross-writer genuine negatives:
+      Cross-writer genuines are trivially pushed apart (different writers
+      already differ) and hijack the gradient.  The model ends up learning
+      "make genuine signatures look different from each other", which
+      collapses genuine-genuine cosine similarity and produces 85%+ FRR.
+      Only same-writer skilled forgeries are the relevant threat.
+
+    Returns (loss_scalar, n_triplets)
     """
     device  = embeddings.device
     N       = len(embeddings)
@@ -95,49 +108,34 @@ def triplet_loss_semihard(
     is_gen  = torch.as_tensor(is_genuine, dtype=torch.bool, device=device)
     is_forg = ~is_gen
 
-    # Pairwise cosine distance; embeddings are L2-normalised so dot = cosine sim
     sim  = torch.mm(embeddings, embeddings.t()).clamp(-1.0, 1.0)
-    dist = 1.0 - sim   # cosine distance, range [0, 2]
+    dist = 1.0 - sim   # cosine distance [0, 2]
 
-    same_w = wids.unsqueeze(0) == wids.unsqueeze(1)                  # [N, N]
+    same_w = wids.unsqueeze(0) == wids.unsqueeze(1)   # [N, N]
     eye    = torch.eye(N, dtype=torch.bool, device=device)
 
-    # --- Anchor-positive: same writer, both genuine, not self ----------------
+    # Hardest positive per anchor: same writer, genuine, not self
     ap_mask = same_w & is_gen.unsqueeze(0) & is_gen.unsqueeze(1) & ~eye
-    # invalid positions get -1 so they lose the max() (real distances are >= 0)
-    d_ap, _ = dist.masked_fill(~ap_mask, -1.0).max(dim=1)   # hardest positive
+    d_ap, _ = dist.masked_fill(~ap_mask, -1.0).max(dim=1)   # [N]
     has_pos = ap_mask.any(dim=1)
 
-    # --- Negative pool -------------------------------------------------------
-    # Primary: same-writer skilled forgeries (key threat for a bank)
-    an_primary   = same_w & is_forg.unsqueeze(0)
-    # Secondary: different-writer genuines (easy negatives for regularisation;
-    #   semi-hard mining naturally prefers primary since forgeries are closer)
-    an_secondary = ~same_w & is_gen.unsqueeze(0)
-    an_mask      = an_primary | an_secondary
-
-    # --- Semi-hard selection -------------------------------------------------
-    d_ap_exp = d_ap.unsqueeze(1).expand(N, N)
-    sh_mask  = an_mask & (dist > d_ap_exp) & (dist < d_ap_exp + margin)
-    has_sh   = sh_mask.any(dim=1)
-
-    # Closest semi-hard negative; 2.0 is the max cosine distance so it loses min()
-    d_neg_sh  = dist.masked_fill(~sh_mask, 2.0).min(dim=1).values
-    # Closest valid negative (hardest) used when no semi-hard exists
-    d_neg_hrd = dist.masked_fill(~an_mask, 2.0).min(dim=1).values
-
-    d_neg   = torch.where(has_sh, d_neg_sh, d_neg_hrd)
+    # Same-writer skilled forgeries ONLY — no cross-writer genuine negatives
+    an_mask = same_w & is_forg.unsqueeze(0)   # [N, N]
     has_neg = an_mask.any(dim=1)
 
-    # --- Loss ----------------------------------------------------------------
-    anchor_mask = is_gen & has_pos & has_neg
-    loss_active = F.relu(d_ap - d_neg + margin)[anchor_mask]
-    n_triplets  = int(anchor_mask.sum().item())
+    # All-pairs loss
+    anchor_valid = is_gen & has_pos & has_neg
+    d_ap_exp     = d_ap.unsqueeze(1).expand(N, N)
+    pair_loss    = F.relu(d_ap_exp - dist + margin)         # [N, N]
+    valid        = anchor_valid.unsqueeze(1) & an_mask      # [N, N]
+
+    active     = pair_loss[valid]
+    n_triplets = int(valid.sum().item())
 
     if n_triplets == 0:
-        return embeddings.sum() * 0.0, 0   # zero loss with gradient
+        return embeddings.sum() * 0.0, 0
 
-    return loss_active.mean(), n_triplets
+    return active.mean(), n_triplets
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +192,7 @@ def train(sanity: bool = False) -> None:
     # ----------------------------------------------------------------
     # Dataset + sampler + loader
     # ----------------------------------------------------------------
-    dataset     = CEDARImageDataset(cache_dir, TRAIN_WRITERS)
+    dataset     = CEDARImageDataset(cache_dir, TRAIN_WRITERS, augment=(not sanity))
     num_batches = 4               if sanity else NUM_BATCHES_PER_EPOCH
     epochs      = 1               if sanity else NUM_EPOCHS
     pk_seed     = SEED            if sanity else None   # fixed seed for reproducible sanity
@@ -221,8 +219,10 @@ def train(sanity: bool = False) -> None:
           f"(~{num_batches*P*K_GENUINE:,} triplets/epoch)")
     print(f"Epochs          : {epochs}")
     print(f"Margin          : {MARGIN}  (cosine distance)")
-    print(f"LR              : {LEARNING_RATE}  "
-          f"(halved after epoch {LR_DECAY_EPOCH})")
+    print(f"LR              : backbone(layer4)={LEARNING_RATE}  fc={LR_FC}  "
+          f"(halved after epoch {LR_DECAY_EPOCH}, weight_decay=5e-3)")
+    print(f"Augmentation    : {'OFF (sanity)' if sanity else 'ON'}")
+    print(f"Frozen layers   : conv1, bn1, layer1-3  (layer4 + fc trainable)")
     if sanity:
         print("*** SANITY MODE — 1 epoch, 4 batches ***")
     print("-" * 55)
@@ -231,7 +231,28 @@ def train(sanity: bool = False) -> None:
     # Model / optimiser / scheduler
     # ----------------------------------------------------------------
     model     = SiameseNetwork(embedding_dim=EMBEDDING_DIM).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # Freeze conv1 through layer3; layer4 + fc are trainable.
+    # layer4 uses LR=1e-5 (10x smaller than previous attempt) so it adapts
+    # slowly enough that weight_decay=5e-3 can prevent writer-specific overfitting.
+    # fc uses LR=1e-4 for faster convergence of the projection head.
+    for name, param in model.backbone.named_parameters():
+        if not (name.startswith("layer4") or name.startswith("fc")):
+            param.requires_grad = False
+
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total     = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {n_trainable:,} / {n_total:,}  "
+          f"(layer4 + fc; conv1-layer3 frozen)")
+
+    layer4_params = [p for n, p in model.backbone.named_parameters()
+                     if n.startswith("layer4") and p.requires_grad]
+    fc_params     = [p for n, p in model.backbone.named_parameters()
+                     if n.startswith("fc") and p.requires_grad]
+    optimizer = torch.optim.Adam([
+        {"params": layer4_params, "lr": LEARNING_RATE},
+        {"params": fc_params,     "lr": LR_FC},
+    ], weight_decay=5e-3)
     # Halve LR after LR_DECAY_EPOCH so later epochs do finer refinement
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[LR_DECAY_EPOCH], gamma=LR_DECAY_FACTOR
@@ -245,7 +266,8 @@ def train(sanity: bool = False) -> None:
     run_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_file.write(
         f"\n--- Run started {run_start}  "
-        f"(loss=triplet, margin={MARGIN}, lr={LEARNING_RATE}, "
+        f"(loss=triplet_allpairs, margin={MARGIN}, lr_layer4={LEARNING_RATE}, lr_fc={LR_FC}, wd=5e-3, "
+        f"frozen=conv1-layer3, layer4+fc trainable, augment={not sanity}, "
         f"P={P}, K_gen={K_GENUINE}, K_forg={K_FORGERY}, "
         f"epochs={epochs}, batches/epoch={num_batches}"
         f"{'  SANITY' if sanity else ''}) ---\n"
@@ -269,7 +291,7 @@ def train(sanity: bool = False) -> None:
             imgs = imgs.to(device)                     # [B, 1, 224, 224]
             embs = model._embed(imgs)                  # [B, 128], L2-normalised
 
-            loss, n_trip = triplet_loss_semihard(
+            loss, n_trip = triplet_loss_allpairs(
                 embs,
                 writer_ids.tolist(),
                 is_genuine.tolist(),
@@ -309,8 +331,9 @@ def train(sanity: bool = False) -> None:
             remaining = duration * (epochs - 1)
             print(f"  --> Est. remaining: {remaining/60:.1f} min "
                   f"({remaining/3600:.2f} hr)")
-            # Collapse gate: triplet loss near zero after one epoch means the
-            # semi-hard mining found no violating triplets — indicates collapse.
+            # Collapse gate: all-pairs loss near zero after epoch 1 means ALL
+            # same-writer forgeries already satisfied the margin — indicates
+            # collapse or a margin that is too small.
             if epoch_loss < 0.01:
                 print(
                     f"\n  *** COLLAPSE WARNING: epoch-1 loss = {epoch_loss:.6f} "
