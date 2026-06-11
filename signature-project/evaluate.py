@@ -56,6 +56,7 @@ import matplotlib.pyplot as plt
 
 from preprocess import preprocess_signature
 from model      import SiameseNetwork
+from dataset    import IMAGENET_MEAN, IMAGENET_STD
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +243,10 @@ def compute_scores(
             for path_a, path_b in batch:
                 arr_a = preprocess_signature(path_a).astype(np.float32) / 255.0
                 arr_b = preprocess_signature(path_b).astype(np.float32) / 255.0
-                # unsqueeze(0) adds the channel dimension: (224,224) → (1,224,224)
+                # ImageNet normalisation — must match the normalisation applied
+                # during training (dataset.py CEDARImageDataset.__getitem__).
+                arr_a = (arr_a - IMAGENET_MEAN) / IMAGENET_STD
+                arr_b = (arr_b - IMAGENET_MEAN) / IMAGENET_STD
                 imgs_a.append(torch.from_numpy(arr_a).unsqueeze(0))
                 imgs_b.append(torch.from_numpy(arr_b).unsqueeze(0))
 
@@ -382,6 +386,54 @@ def compute_eer(
 
 
 # ---------------------------------------------------------------------------
+# Operating-point table
+# ---------------------------------------------------------------------------
+
+def compute_operating_points(
+    thresholds:  np.ndarray,
+    fars:        np.ndarray,
+    frrs:        np.ndarray,
+    far_targets: list,
+) -> list:
+    """
+    For each FAR target find the decision threshold and FRR.
+
+    The operating point at FAR=X% is the LOWEST threshold where FAR<=X%.
+    Lowest threshold = least restrictive gate that still stays within the
+    FAR budget, which gives the lowest possible FRR at that FAR level.
+
+    Parameters
+    ----------
+    thresholds  : sorted ascending cosine-similarity values
+    fars        : FAR at each threshold (decreasing as threshold rises)
+    frrs        : FRR at each threshold (increasing as threshold rises)
+    far_targets : list of floats in [0, 1], e.g. [0.005, 0.01, 0.02, 0.05]
+
+    Returns
+    -------
+    list of dicts with keys: far_target, threshold, actual_far, frr
+    (all in [0, 1], not percentages)
+    """
+    rows = []
+    for target in far_targets:
+        valid = np.where(fars <= target)[0]
+        if len(valid) == 0:
+            rows.append(
+                {"far_target": target, "threshold": None,
+                 "actual_far": None,   "frr": None}
+            )
+        else:
+            i = valid[0]   # lowest threshold achieving FAR <= target
+            rows.append(
+                {"far_target": target,
+                 "threshold":  float(thresholds[i]),
+                 "actual_far": float(fars[i]),
+                 "frr":        float(frrs[i])}
+            )
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 
@@ -390,41 +442,47 @@ def plot_score_distributions(
     forgery_scores: np.ndarray,
     eer_threshold:  float,
     plots_dir:      str,
+    far1_threshold: float = None,
 ) -> None:
     """
     Draw overlapping histograms of cosine-similarity scores and save to PNG.
 
-    A well-trained model should show two clearly separated bell curves:
-      • Genuine-genuine scores concentrated near +1  (high similarity)
-      • Genuine-forgery scores concentrated near  0  (low similarity)
+    Marks the EER threshold (black dashed) and the FAR=1% operating threshold
+    (red dashed) so the bank's primary operating point is immediately visible.
 
     Parameters
     ----------
-    genuine_scores : np.ndarray   scores for genuine-genuine pairs
-    forgery_scores : np.ndarray   scores for genuine-forgery pairs
-    eer_threshold  : float        decision threshold at the EER point
-    plots_dir      : str          output directory
+    genuine_scores  : scores for genuine-genuine pairs
+    forgery_scores  : scores for genuine-forgery pairs
+    eer_threshold   : cosine-similarity threshold at the EER point
+    plots_dir       : output directory
+    far1_threshold  : cosine-similarity threshold at FAR=1% (None = omit line)
     """
     fig, ax = plt.subplots(figsize=(9, 5))
 
-    # 60 bins across the full [-1, 1] range gives a smooth histogram without
-    # being too noisy.  alpha=0.55 makes both histograms visible where they overlap.
     bins = np.linspace(-1.0, 1.0, 61)
 
     ax.hist(
         genuine_scores, bins=bins,
-        color="steelblue", alpha=0.55, label=f"Genuine-Genuine  (n={len(genuine_scores):,})",
+        color="steelblue", alpha=0.55,
+        label=f"Genuine-Genuine  (n={len(genuine_scores):,})",
     )
     ax.hist(
         forgery_scores, bins=bins,
-        color="tomato",    alpha=0.55, label=f"Genuine-Forgery  (n={len(forgery_scores):,})",
+        color="tomato", alpha=0.55,
+        label=f"Genuine-Forgery  (n={len(forgery_scores):,})",
     )
 
-    # Vertical dashed line marks the EER decision threshold.
     ax.axvline(
         eer_threshold, color="black", linestyle="--", linewidth=1.5,
         label=f"EER threshold = {eer_threshold:.3f}",
     )
+
+    if far1_threshold is not None:
+        ax.axvline(
+            far1_threshold, color="red", linestyle="--", linewidth=1.5,
+            label=f"FAR=1% threshold = {far1_threshold:.3f}",
+        )
 
     ax.set_xlabel("Cosine Similarity", fontsize=12)
     ax.set_ylabel("Number of Pairs",   fontsize=12)
@@ -439,7 +497,7 @@ def plot_score_distributions(
     out_path = os.path.join(plots_dir, "score_distributions.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved  →  {out_path}")
+    print(f"Saved -> {out_path}")
 
 
 def plot_far_frr_curve(
@@ -495,7 +553,7 @@ def plot_far_frr_curve(
     out_path = os.path.join(plots_dir, "far_frr_curve.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved  →  {out_path}")
+    print(f"Saved -> {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +618,7 @@ def evaluate(checkpoint_path: str = DEFAULT_CKPT) -> None:
     # ----------------------------------------------------------------
     # Compute EER
     # ----------------------------------------------------------------
-    print("Computing EER …")
+    print("Computing EER and operating points …")
     eer, eer_threshold, thresholds, fars, frrs = compute_eer(
         genuine_scores, forgery_scores
     )
@@ -576,10 +634,40 @@ def evaluate(checkpoint_path: str = DEFAULT_CKPT) -> None:
     print("-" * 50)
 
     # ----------------------------------------------------------------
+    # Operating-point table (bank's primary metric: FAR against forgeries)
+    # ----------------------------------------------------------------
+    FAR_TARGETS = [0.005, 0.01, 0.02, 0.05]
+    op_points   = compute_operating_points(thresholds, fars, frrs, FAR_TARGETS)
+
+    print("\n  Operating points (FAR measured against skilled forgeries):\n")
+    print(f"  {'FAR target':>10}  {'Threshold':>10}  {'Actual FAR':>11}  {'FRR (miss)':>11}")
+    print(f"  {'-'*10}  {'-'*10}  {'-'*11}  {'-'*11}")
+    for row in op_points:
+        if row["threshold"] is None:
+            print(f"  {row['far_target']*100:>9.1f}%  {'N/A':>10}  {'N/A':>11}  {'N/A':>11}")
+        else:
+            print(
+                f"  {row['far_target']*100:>9.1f}%  "
+                f"{row['threshold']:>10.4f}  "
+                f"{row['actual_far']*100:>10.2f}%  "
+                f"{row['frr']*100:>10.2f}%"
+            )
+    print()
+    print("-" * 50)
+
+    # Extract the FAR=1% threshold for the histogram marker
+    far1_row       = next((r for r in op_points if r["far_target"] == 0.01), None)
+    far1_threshold = far1_row["threshold"] if far1_row else None
+
+    # ----------------------------------------------------------------
     # Save plots
     # ----------------------------------------------------------------
     print("Saving plots …")
-    plot_score_distributions(genuine_scores, forgery_scores, eer_threshold, plots_dir)
+    plot_score_distributions(
+        genuine_scores, forgery_scores,
+        eer_threshold, plots_dir,
+        far1_threshold=far1_threshold,
+    )
     plot_far_frr_curve(thresholds, fars, frrs, eer, eer_threshold, plots_dir)
 
     print("-" * 50)

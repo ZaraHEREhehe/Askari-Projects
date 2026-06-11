@@ -352,4 +352,4 @@ if __name__ == "__main__":
     # --- Optionally save plot -------------------------------------------
     if args.save_plot:
         out_path = save_comparison_plot(args.image_a, args.image_b, result)
-        print(f"Comparison image saved  →  {out_path}\n")
+        print(f"Comparison image saved -> {out_path}\n")
