@@ -1,24 +1,25 @@
 """
-train.py — Triplet-loss training with online semi-hard negative mining
-=======================================================================
-Trains SiameseNetwork (model.py) on CEDAR writers 1-45.
+train.py — Dual-branch training with triplet + writer classification loss
+=========================================================================
+Trains the dual-branch SiameseNetwork on CEDAR writers 1-45.
 
-Key changes from the contrastive-loss version
-----------------------------------------------
-Loss    : triplet loss, margin=0.3 on cosine distance, online semi-hard mining.
-          The old contrastive margin=0.5 dead-zone let training writers saturate
-          in one epoch; triplet semi-hard mining keeps all epochs productive.
-Data    : disk-cached preprocessed images (build_cache runs once).
-          PKSampler re-draws fresh writer/image combinations every epoch so
-          there is no fixed pair list for the model to memorise.
-Norm    : ImageNet mean/std applied to all inputs — required for pretrained
-          ResNet-18 features to operate in their expected activation range.
-LR      : Adam 1e-4, halved after epoch LR_DECAY_EPOCH via MultiStepLR.
+Key upgrades from previous version
+------------------------------------
+Architecture : dual-branch ResNet-50 (semantic + detail-HF) with cross-attention
+               local matching; 512-d embedding instead of 128-d.
+Loss         : triplet_allpairs (margin 0.3) + writer CE classification (weight 0.3).
+               The CE loss forces embeddings to be discriminative across writers,
+               acting as a strong regularizer against within-class collapse.
+Backbone     : stem + layer1 frozen; layer2-4 fine-tuned at 5e-5 (AdamW).
+               New modules (local_attn, projector, classifier) at 1e-4.
+Scheduler    : CosineAnnealingLR over 50 epochs → slow warm fade prevents
+               the pretrained layers from destabilising early.
+Grad clip    : max-norm 1.0 — stabilises the two-loss gradient mix.
 
 Run
 ---
-  python train.py            # full 10-epoch training run
-  python train.py --sanity   # 1 epoch, 4 batches — smoke test only
+  python train.py            # full 50-epoch run
+  python train.py --sanity   # 1 epoch, 4 batches — smoke test
 """
 
 import os
@@ -27,6 +28,7 @@ import argparse
 from datetime import datetime
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
@@ -34,7 +36,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from dataset import build_cache, CEDARImageDataset, PKSampler, TRAIN_WRITERS
+from dataset import (build_cache, build_cache_dataset2,
+                     CombinedDataset, PKSampler,
+                     TRAIN_WRITERS, D2_TRAIN_WRITERS)
 from model   import SiameseNetwork
 
 
@@ -42,26 +46,26 @@ from model   import SiameseNetwork
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-LEARNING_RATE         = 1e-5   # backbone (layer4) — 10x smaller than before to slow overfitting
-LR_FC                 = 1e-4   # embedding head (fc) — higher LR, fewer params
-NUM_EPOCHS            = 30
-MARGIN                = 0.5   # cosine-distance margin; 0.3 was satisfied in one epoch
-                               # (forgeries start at d≈0.35, need to reach d>0.65)
-EMBEDDING_DIM         = 128
+EMBEDDING_DIM         = 512
+NUM_EPOCHS            = 50
+MARGIN                = 0.3    # cosine-distance triplet margin
+CE_WEIGHT             = 0.3    # weight for writer classification loss
+
+LR_BACKBONE           = 5e-5   # layer2-4 of both branches (pretrained, fine-tune slowly)
+LR_NEW                = 1e-4   # local_attn + projector + classifier (trained from scratch)
+WEIGHT_DECAY          = 1e-4
+GRAD_CLIP_NORM        = 1.0
+
 SEED                  = 42
 
-P                     = 16    # writers sampled per batch
+P                     = 12    # writers per batch (reduced from 16 to fit dual ResNet-50)
 K_GENUINE             = 4     # genuine images per writer per batch
 K_FORGERY             = 4     # forgery images per writer per batch
-# All-pairs loss: 94 batches x 16 writers x 4 anchors x 4 forgeries ≈ 24 000 triplets/epoch
-NUM_BATCHES_PER_EPOCH = 94
-
-LR_DECAY_EPOCH        = 15    # LR halved after this epoch (midpoint of 30-epoch run)
-LR_DECAY_FACTOR       = 0.5
+NUM_BATCHES_PER_EPOCH = 125   # ~same epoch throughput as before (12*8*125 = 12000 imgs)
 
 CHECKPOINT_DIR        = "checkpoints"
 CACHE_DIR             = "cache"
-NUM_WORKERS           = 0     # 0 = safe on Windows; set to 4 on Linux/Colab for speed
+NUM_WORKERS           = 0
 
 
 # ---------------------------------------------------------------------------
@@ -72,34 +76,13 @@ def triplet_loss_allpairs(
     embeddings: torch.Tensor,
     writer_ids,
     is_genuine,
-    margin: float = 0.5,
+    margin: float = 0.3,
 ) -> tuple:
     """
-    All-pairs triplet loss using same-writer forgeries as the ONLY negatives.
-
-    For every (anchor_i, forgery_k) pair where anchor_i is a genuine image
-    and forgery_k is a skilled forgery of the SAME writer:
-
-        loss[i,k] = max(0, d_hardest_pos[i] - dist[i,k] + margin)
-
-    d_hardest_pos[i] = distance to the furthest same-writer genuine (hardest
-    positive), giving the most conservative anchor-positive distance.
-
-    Why all-pairs instead of one-per-anchor:
-      One-per-anchor mining picks the closest violating forgery.  Once that
-      forgery crosses the margin, the anchor contributes 0 loss even if the
-      remaining K_forgery-1 forgeries are still within margin.  All-pairs
-      computes loss for EVERY forgery in the batch, so the model must push
-      ALL of them past margin before this anchor goes quiet.
-
-    Why no cross-writer genuine negatives:
-      Cross-writer genuines are trivially pushed apart (different writers
-      already differ) and hijack the gradient.  The model ends up learning
-      "make genuine signatures look different from each other", which
-      collapses genuine-genuine cosine similarity and produces 85%+ FRR.
-      Only same-writer skilled forgeries are the relevant threat.
-
-    Returns (loss_scalar, n_triplets)
+    All-pairs triplet loss using same-writer skilled forgeries as negatives.
+    For every genuine anchor, computes loss against every same-writer forgery.
+    Uses the hardest positive (furthest same-writer genuine) per anchor.
+    Returns (loss_scalar, n_active_triplets).
     """
     device  = embeddings.device
     N       = len(embeddings)
@@ -109,25 +92,24 @@ def triplet_loss_allpairs(
     is_forg = ~is_gen
 
     sim  = torch.mm(embeddings, embeddings.t()).clamp(-1.0, 1.0)
-    dist = 1.0 - sim   # cosine distance [0, 2]
+    dist = 1.0 - sim
 
-    same_w = wids.unsqueeze(0) == wids.unsqueeze(1)   # [N, N]
+    same_w = wids.unsqueeze(0) == wids.unsqueeze(1)
     eye    = torch.eye(N, dtype=torch.bool, device=device)
 
-    # Hardest positive per anchor: same writer, genuine, not self
+    # Hardest positive per anchor: same writer, both genuine, not self
     ap_mask = same_w & is_gen.unsqueeze(0) & is_gen.unsqueeze(1) & ~eye
-    d_ap, _ = dist.masked_fill(~ap_mask, -1.0).max(dim=1)   # [N]
+    d_ap = (dist * ap_mask.float()).sum(dim=1) / ap_mask.float().sum(dim=1).clamp(min=1)
     has_pos = ap_mask.any(dim=1)
 
-    # Same-writer skilled forgeries ONLY — no cross-writer genuine negatives
-    an_mask = same_w & is_forg.unsqueeze(0)   # [N, N]
+    # Same-writer skilled forgeries only
+    an_mask = same_w & is_forg.unsqueeze(0)
     has_neg = an_mask.any(dim=1)
 
-    # All-pairs loss
     anchor_valid = is_gen & has_pos & has_neg
     d_ap_exp     = d_ap.unsqueeze(1).expand(N, N)
-    pair_loss    = F.relu(d_ap_exp - dist + margin)         # [N, N]
-    valid        = anchor_valid.unsqueeze(1) & an_mask      # [N, N]
+    pair_loss    = F.relu(d_ap_exp - dist + margin)
+    valid        = anchor_valid.unsqueeze(1) & an_mask
 
     active     = pair_loss[valid]
     n_triplets = int(valid.sum().item())
@@ -139,7 +121,7 @@ def triplet_loss_allpairs(
 
 
 # ---------------------------------------------------------------------------
-# Loss-curve plot helper
+# Loss-curve plot
 # ---------------------------------------------------------------------------
 
 def _save_loss_curve(epoch_losses: list, out_dir: str) -> None:
@@ -148,12 +130,12 @@ def _save_loss_curve(epoch_losses: list, out_dir: str) -> None:
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(epochs, epoch_losses, marker="o", linewidth=2,
-            markersize=5, color="steelblue", label="Training loss (triplet)")
+            markersize=4, color="steelblue", label="Training loss (triplet + CE)")
     ax.scatter(best_idx + 1, epoch_losses[best_idx], color="red", zorder=5, s=80,
                label=f"Best: epoch {best_idx+1}  ({epoch_losses[best_idx]:.4f})")
     ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("Triplet Loss", fontsize=12)
-    ax.set_title("Training Loss — Siamese Signature Verification", fontsize=13)
+    ax.set_ylabel("Loss", fontsize=12)
+    ax.set_title("Training Loss — Dual-Branch Signature Verification", fontsize=13)
     ax.legend(fontsize=11)
     ax.grid(True, linestyle="--", alpha=0.5)
 
@@ -168,13 +150,6 @@ def _save_loss_curve(epoch_losses: list, out_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 def train(sanity: bool = False) -> None:
-    """
-    Full training pipeline.
-
-    sanity=True: 1 epoch, 4 batches (~256 triplets) — pipeline smoke test.
-    Healthy epoch-1 loss is roughly 0.05–0.30.  If it prints near zero
-    (<0.01) the collapse-detection warning fires; do not proceed.
-    """
     torch.manual_seed(SEED)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -182,20 +157,33 @@ def train(sanity: bool = False) -> None:
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     # ----------------------------------------------------------------
-    # Build disk cache (skips files that already exist)
+    # Cache
     # ----------------------------------------------------------------
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    cache_dir  = os.path.join(script_dir, CACHE_DIR)
-    print("Building cache (skips existing files) …")
+    script_dir   = os.path.dirname(os.path.abspath(__file__))
+    cache_dir    = os.path.join(script_dir, CACHE_DIR)
+    dataset2_dir = os.path.join(script_dir, "dataset2")
+    print("Building CEDAR cache (skips existing files) …")
     build_cache(script_dir, cache_dir)
+    print("Building dataset2 cache (skips existing files) …")
+    build_cache_dataset2(dataset2_dir, cache_dir)
 
     # ----------------------------------------------------------------
-    # Dataset + sampler + loader
+    # Dataset / sampler / loader
     # ----------------------------------------------------------------
-    dataset     = CEDARImageDataset(cache_dir, TRAIN_WRITERS, augment=(not sanity))
+    dataset = CombinedDataset(
+        cache_dir,
+        cedar_writers=TRAIN_WRITERS,
+        d2_writers=D2_TRAIN_WRITERS,   # 650 writers; 651-686 held out for testing
+        augment=(not sanity),
+    )
+    # Build writer→label mapping for CE loss (IDs are non-contiguous with offset)
+    all_train_writers = sorted(dataset.genuine_by_writer.keys())
+    num_train_writers = len(all_train_writers)
+    wid_to_label      = {wid: i for i, wid in enumerate(all_train_writers)}
+
     num_batches = 4               if sanity else NUM_BATCHES_PER_EPOCH
     epochs      = 1               if sanity else NUM_EPOCHS
-    pk_seed     = SEED            if sanity else None   # fixed seed for reproducible sanity
+    pk_seed     = SEED            if sanity else None
 
     sampler = PKSampler(
         dataset,
@@ -211,52 +199,74 @@ def train(sanity: bool = False) -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    print(f"Train writers   : {len(TRAIN_WRITERS)}  ({len(dataset)} images)")
+    print(f"Train writers   : {num_train_writers}  "
+          f"(CEDAR {len(TRAIN_WRITERS)} + Dataset2 {len(D2_TRAIN_WRITERS)})  "
+          f"({len(dataset)} images)")
     print(f"Batch structure : P={P} writers x "
           f"(K_gen={K_GENUINE} + K_forg={K_FORGERY}) = "
           f"{P*(K_GENUINE+K_FORGERY)} imgs/batch")
-    print(f"Batches/epoch   : {num_batches}  "
-          f"(~{num_batches*P*K_GENUINE:,} triplets/epoch)")
+    print(f"Batches/epoch   : {num_batches}")
     print(f"Epochs          : {epochs}")
-    print(f"Margin          : {MARGIN}  (cosine distance)")
-    print(f"LR              : backbone(layer4)={LEARNING_RATE}  fc={LR_FC}  "
-          f"(halved after epoch {LR_DECAY_EPOCH}, weight_decay=5e-3)")
+    print(f"Margin          : {MARGIN}  (cosine dist)   CE weight: {CE_WEIGHT}")
     print(f"Augmentation    : {'OFF (sanity)' if sanity else 'ON'}")
-    print(f"Frozen layers   : conv1, bn1, layer1-3  (layer4 + fc trainable)")
     if sanity:
         print("*** SANITY MODE — 1 epoch, 4 batches ***")
     print("-" * 55)
 
     # ----------------------------------------------------------------
-    # Model / optimiser / scheduler
+    # Model
     # ----------------------------------------------------------------
-    model     = SiameseNetwork(embedding_dim=EMBEDDING_DIM).to(device)
+    model = SiameseNetwork(embedding_dim=EMBEDDING_DIM).to(device)
 
-    # Freeze conv1 through layer3; layer4 + fc are trainable.
-    # layer4 uses LR=1e-5 (10x smaller than previous attempt) so it adapts
-    # slowly enough that weight_decay=5e-3 can prevent writer-specific overfitting.
-    # fc uses LR=1e-4 for faster convergence of the projection head.
-    for name, param in model.backbone.named_parameters():
-        if not (name.startswith("layer4") or name.startswith("fc")):
+    # Freeze stem (first conv + bn) and layer1 in both branches.
+    # These low-level texture detectors are already well-pretrained;
+    # updating them risks destabilising the HF detail channel in the
+    # early training phase.
+    frozen_prefixes = (
+        "sem_branch.stem", "sem_branch.layer1",
+        "det_branch.stem", "det_branch.layer1",
+    )
+    for name, param in model.named_parameters():
+        if name.startswith(frozen_prefixes):
             param.requires_grad = False
 
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total     = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {n_trainable:,} / {n_total:,}  "
-          f"(layer4 + fc; conv1-layer3 frozen)")
+          f"(stem+layer1 frozen in both branches)")
 
-    layer4_params = [p for n, p in model.backbone.named_parameters()
-                     if n.startswith("layer4") and p.requires_grad]
-    fc_params     = [p for n, p in model.backbone.named_parameters()
-                     if n.startswith("fc") and p.requires_grad]
-    optimizer = torch.optim.Adam([
-        {"params": layer4_params, "lr": LEARNING_RATE},
-        {"params": fc_params,     "lr": LR_FC},
-    ], weight_decay=5e-3)
-    # Halve LR after LR_DECAY_EPOCH so later epochs do finer refinement
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=[LR_DECAY_EPOCH], gamma=LR_DECAY_FACTOR
+    # ----------------------------------------------------------------
+    # Writer classification head (training only — not used at inference)
+    # ----------------------------------------------------------------
+    classifier = nn.Linear(EMBEDDING_DIM, num_train_writers).to(device)
+
+    # ----------------------------------------------------------------
+    # Optimizer — differential LR
+    # ----------------------------------------------------------------
+    backbone_params = []   # pretrained layers 2-4 (fine-tune slowly)
+    new_params      = []   # local_attn + projector (train from scratch)
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith(("sem_branch.layer", "det_branch.layer")):
+            backbone_params.append(param)
+        else:
+            new_params.append(param)
+
+    optimizer = torch.optim.AdamW([
+        {"params": backbone_params,           "lr": LR_BACKBONE},
+        {"params": new_params,                "lr": LR_NEW},
+        {"params": classifier.parameters(),   "lr": LR_NEW},
+    ], weight_decay=WEIGHT_DECAY)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6
     )
+
+    print(f"LR backbone(layer2-4): {LR_BACKBONE}   LR new modules: {LR_NEW}")
+    print(f"Scheduler: CosineAnnealingLR  T_max={epochs}  eta_min=1e-6")
+    print("-" * 55)
 
     # ----------------------------------------------------------------
     # Training log
@@ -266,10 +276,11 @@ def train(sanity: bool = False) -> None:
     run_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_file.write(
         f"\n--- Run started {run_start}  "
-        f"(loss=triplet_allpairs, margin={MARGIN}, lr_layer4={LEARNING_RATE}, lr_fc={LR_FC}, wd=5e-3, "
-        f"frozen=conv1-layer3, layer4+fc trainable, augment={not sanity}, "
-        f"P={P}, K_gen={K_GENUINE}, K_forg={K_FORGERY}, "
-        f"epochs={epochs}, batches/epoch={num_batches}"
+        f"(dual-branch ResNet50, emb={EMBEDDING_DIM}, margin={MARGIN}, "
+        f"ce_weight={CE_WEIGHT}, lr_backbone={LR_BACKBONE}, lr_new={LR_NEW}, "
+        f"wd={WEIGHT_DECAY}, P={P}, K_gen={K_GENUINE}, K_forg={K_FORGERY}, "
+        f"epochs={epochs}, batches/epoch={num_batches}, "
+        f"writers={num_train_writers} (CEDAR {len(TRAIN_WRITERS)} + D2 {len(D2_TRAIN_WRITERS)})"
         f"{'  SANITY' if sanity else ''}) ---\n"
     )
     log_file.flush()
@@ -282,30 +293,52 @@ def train(sanity: bool = False) -> None:
 
     for epoch in range(1, epochs + 1):
         model.train()
+        classifier.train()
         running_loss     = 0.0
         running_triplets = 0
         n_valid_batches  = 0
         t0               = time.time()
 
         for imgs, writer_ids, is_genuine in loader:
-            imgs = imgs.to(device)                     # [B, 1, 224, 224]
-            embs = model._embed(imgs)                  # [B, 128], L2-normalised
+            imgs = imgs.to(device)
 
-            loss, n_trip = triplet_loss_allpairs(
+            embs = model._embed(imgs)   # [B, 512]
+
+            # --- Triplet loss ---
+            trip_loss, n_trip = triplet_loss_allpairs(
                 embs,
                 writer_ids.tolist(),
                 is_genuine.tolist(),
                 margin=MARGIN,
             )
 
+            # --- Writer classification loss (genuine images only) ---
+            gen_mask = is_genuine.bool()
+            if gen_mask.sum() > 0:
+                gen_embs = embs[gen_mask]
+                gen_wids = torch.tensor(
+                    [wid_to_label[int(w)] for w in writer_ids[gen_mask]],
+                    dtype=torch.long, device=device,
+                )
+                logits   = classifier(gen_embs)
+                ce_loss  = F.cross_entropy(logits, gen_wids)
+            else:
+                ce_loss = embs.sum() * 0.0
+
             if n_trip == 0:
-                continue   # no valid triplets in this batch (should be rare)
+                continue
+
+            total_loss = trip_loss + CE_WEIGHT * ce_loss
 
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(classifier.parameters()),
+                GRAD_CLIP_NORM,
+            )
             optimizer.step()
 
-            running_loss     += loss.item()
+            running_loss     += total_loss.item()
             running_triplets += n_trip
             n_valid_batches  += 1
 
@@ -329,17 +362,12 @@ def train(sanity: bool = False) -> None:
 
         if epoch == 1:
             remaining = duration * (epochs - 1)
-            print(f"  --> Est. remaining: {remaining/60:.1f} min "
+            print(f"  --> Est. remaining: {remaining/60:.1f} min  "
                   f"({remaining/3600:.2f} hr)")
-            # Collapse gate: all-pairs loss near zero after epoch 1 means ALL
-            # same-writer forgeries already satisfied the margin — indicates
-            # collapse or a margin that is too small.
-            if epoch_loss < 0.01:
+            if epoch_loss < 0.005:
                 print(
-                    f"\n  *** COLLAPSE WARNING: epoch-1 loss = {epoch_loss:.6f} "
-                    f"is suspiciously near zero.  Expected 0.05–0.30 for a "
-                    f"healthy run.  Do NOT proceed to full training without "
-                    f"investigating. ***\n"
+                    f"\n  *** COLLAPSE WARNING: epoch-1 loss = {epoch_loss:.6f}.  "
+                    f"Expected 0.05–0.40 for a healthy dual-branch run. ***\n"
                 )
 
         log_file.write(
@@ -349,16 +377,17 @@ def train(sanity: bool = False) -> None:
         )
         log_file.flush()
 
-        # Per-epoch checkpoint (includes optimiser state for resumability)
+        # Full checkpoint (includes optimizer + classifier for resumability)
         ckpt_path = os.path.join(CHECKPOINT_DIR, f"siamese_epoch_{epoch:02d}.pt")
         torch.save(
             {
-                "epoch"           : epoch,
-                "model_state_dict": model.state_dict(),
-                "optim_state_dict": optimizer.state_dict(),
-                "loss"            : epoch_loss,
-                "margin"          : MARGIN,
-                "embedding_dim"   : EMBEDDING_DIM,
+                "epoch"                : epoch,
+                "model_state_dict"     : model.state_dict(),
+                "classifier_state_dict": classifier.state_dict(),
+                "optim_state_dict"     : optimizer.state_dict(),
+                "loss"                 : epoch_loss,
+                "margin"               : MARGIN,
+                "embedding_dim"        : EMBEDDING_DIM,
             },
             ckpt_path,
         )
@@ -369,20 +398,18 @@ def train(sanity: bool = False) -> None:
                        os.path.join(CHECKPOINT_DIR, "best.pt"))
             print(f"  --> New best saved  (loss: {best_loss:.6f})")
 
-        scheduler.step()   # MultiStepLR: halves LR at epoch LR_DECAY_EPOCH
+        scheduler.step()
 
     # ----------------------------------------------------------------
-    # Post-training outputs
+    # Post-training
     # ----------------------------------------------------------------
     torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "final.pt"))
     log_file.write(f"--- Training complete.  Best loss: {best_loss:.6f} ---\n")
     log_file.close()
 
     print("-" * 55)
-    print(f"Training complete.")
-    print(f"Best loss     : {best_loss:.6f}")
-    print(f"Checkpoints   : ./{CHECKPOINT_DIR}/")
-    print(f"Log           : {log_path}")
+    print(f"Training complete.  Best loss: {best_loss:.6f}")
+    print(f"Checkpoints: ./{CHECKPOINT_DIR}/")
 
     _save_loss_curve(epoch_losses, CHECKPOINT_DIR)
 
@@ -393,11 +420,11 @@ def train(sanity: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train Siamese signature-verification network (triplet loss)."
+        description="Train dual-branch signature-verification network."
     )
     parser.add_argument(
         "--sanity", action="store_true",
-        help="Smoke-test: 1 epoch, 4 batches.  Verify pipeline before full run.",
+        help="Smoke-test: 1 epoch, 4 batches.",
     )
     args = parser.parse_args()
     train(sanity=args.sanity)

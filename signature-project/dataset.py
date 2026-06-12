@@ -32,9 +32,17 @@ from preprocess import preprocess_signature
 IMAGENET_MEAN = 0.449
 IMAGENET_STD  = 0.226
 
-TRAIN_WRITERS = list(range(1,  46))
-TEST_WRITERS  = list(range(46, 56))
-SAMPLES_EACH  = 24
+TRAIN_WRITERS    = list(range(1,  46))
+TEST_WRITERS     = list(range(46, 56))
+SAMPLES_EACH     = 24
+
+D2_WRITER_OFFSET = 1000   # dataset2 IDs mapped to 1001–1686 (no clash with CEDAR)
+D2_SAMPLES_EACH  = 10     # 10 genuine + 10 forgery per dataset2 writer
+
+# Writers 1-650 are used for training; 651-686 are held out for testing.
+# This gives an honest evaluation on data the model has never seen.
+D2_TRAIN_WRITERS = list(range(1,   651))   # 650 writers for training
+D2_TEST_WRITERS  = list(range(651, 687))   #  36 writers held out for testing
 
 
 # ---------------------------------------------------------------------------
@@ -196,3 +204,128 @@ class PKSampler(Sampler):
                 indices += rng.choices(self.dataset.genuine_by_writer[wid], k=self.K_genuine)
                 indices += rng.choices(self.dataset.forgery_by_writer[wid], k=self.K_forgery)
             yield indices
+
+
+# ---------------------------------------------------------------------------
+# Dataset2 cache builder
+# ---------------------------------------------------------------------------
+
+def build_cache_dataset2(dataset2_dir: str, cache_dir: str) -> None:
+    """
+    Cache dataset2 images (686 writers, ~10 genuine + 10 forgery each).
+    Folder layout: dataset2/{NNN}/ for genuine, dataset2/{NNN}_forg/ for forgeries.
+    Saved as d2_org_{wid}_{i}.npy and d2_forg_{wid}_{i}.npy.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+
+    writer_dirs = sorted(
+        d for d in os.listdir(dataset2_dir)
+        if os.path.isdir(os.path.join(dataset2_dir, d)) and not d.endswith("_forg")
+    )
+
+    total = 0
+    n_new = 0
+    for wname in writer_dirs:
+        wid      = int(wname)
+        org_dir  = os.path.join(dataset2_dir, wname)
+        forg_dir = os.path.join(dataset2_dir, wname + "_forg")
+
+        org_files  = sorted(f for f in os.listdir(org_dir)  if f.lower().endswith(".jpg"))
+        forg_files = sorted(f for f in os.listdir(forg_dir) if f.lower().endswith(".jpg"))
+
+        for i, fname in enumerate(org_files, 1):
+            dst = os.path.join(cache_dir, f"d2_org_{wid}_{i}.npy")
+            total += 1
+            if not os.path.exists(dst):
+                np.save(dst, preprocess_signature(os.path.join(org_dir, fname)))
+                n_new += 1
+                if n_new % 500 == 0:
+                    print(f"  Cached {n_new} dataset2 images …")
+
+        for i, fname in enumerate(forg_files, 1):
+            dst = os.path.join(cache_dir, f"d2_forg_{wid}_{i}.npy")
+            total += 1
+            if not os.path.exists(dst):
+                np.save(dst, preprocess_signature(os.path.join(forg_dir, fname)))
+                n_new += 1
+                if n_new % 500 == 0:
+                    print(f"  Cached {n_new} dataset2 images …")
+
+    if n_new:
+        print(f"  Cached {n_new} new dataset2 images.")
+    print(f"Dataset2 cache ready — {total} total  ({cache_dir})")
+
+
+# ---------------------------------------------------------------------------
+# Combined dataset (CEDAR + Dataset2)
+# ---------------------------------------------------------------------------
+
+class CombinedDataset(Dataset):
+    """
+    Merges CEDAR training writers and dataset2 writers into one dataset.
+    Dataset2 writer IDs are offset by D2_WRITER_OFFSET to avoid collision
+    with CEDAR IDs.  Drop-in replacement for CEDARImageDataset.
+    """
+
+    def __init__(
+        self,
+        cache_dir:     str,
+        cedar_writers: list,
+        d2_writers:    list,
+        augment:       bool = False,
+    ):
+        self.cache_dir = cache_dir
+        self.augment   = augment
+        self.items     = []
+
+        # CEDAR items
+        for wid in cedar_writers:
+            for i in range(1, SAMPLES_EACH + 1):
+                self.items.append(
+                    (os.path.join(cache_dir, f"org_{wid}_{i}.npy"),  wid, 1)
+                )
+                self.items.append(
+                    (os.path.join(cache_dir, f"forg_{wid}_{i}.npy"), wid, 0)
+                )
+
+        # Dataset2 items (writer IDs offset to avoid clash with CEDAR)
+        for wid in d2_writers:
+            mapped = wid + D2_WRITER_OFFSET
+            for i in range(1, D2_SAMPLES_EACH + 1):
+                org_p  = os.path.join(cache_dir, f"d2_org_{wid}_{i}.npy")
+                forg_p = os.path.join(cache_dir, f"d2_forg_{wid}_{i}.npy")
+                if os.path.exists(org_p):
+                    self.items.append((org_p,  mapped, 1))
+                if os.path.exists(forg_p):
+                    self.items.append((forg_p, mapped, 0))
+
+        # Index maps for PKSampler
+        self.genuine_by_writer: dict = {}
+        self.forgery_by_writer: dict = {}
+        for idx, (_, wid, is_gen) in enumerate(self.items):
+            if is_gen:
+                self.genuine_by_writer.setdefault(wid, []).append(idx)
+            else:
+                self.forgery_by_writer.setdefault(wid, []).append(idx)
+
+        self._aug = T.Compose([
+            T.RandomRotation(degrees=10, fill=1.0),
+            T.RandomAffine(degrees=0, scale=(0.9, 1.1), fill=1.0),
+            T.RandomPerspective(distortion_scale=0.1, p=0.5, fill=1.0),
+            T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
+            T.RandomErasing(p=0.5, scale=(0.02, 0.08), value=1.0),
+        ]) if augment else None
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        path, writer_id, is_genuine = self.items[idx]
+        arr = np.load(path)
+        img = torch.from_numpy(arr.astype(np.float32) / 255.0)
+        img = img.unsqueeze(0)
+        if self._aug is not None:
+            img = self._aug(img)
+        img = (img - IMAGENET_MEAN) / IMAGENET_STD
+        return img, writer_id, is_genuine

@@ -2,5 +2,6 @@ Thumbs.db
 __pycache__/
 *.pyc
 checkpoints/
+dataset2/
 plots/
 *.pt
