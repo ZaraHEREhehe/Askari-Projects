@@ -1,24 +1,24 @@
 """
-train.py — Dual-branch training with triplet + writer classification loss
-=========================================================================
-Trains the dual-branch SiameseNetwork on CEDAR writers 1-45.
+train.py — Dual-branch training with ArcFace + triplet loss
+============================================================
+Trains on CEDAR writers 1-45 + Dataset2 writers 1-650.
 
-Key upgrades from previous version
-------------------------------------
-Architecture : dual-branch ResNet-50 (semantic + detail-HF) with cross-attention
-               local matching; 512-d embedding instead of 128-d.
-Loss         : triplet_allpairs (margin 0.3) + writer CE classification (weight 0.3).
-               The CE loss forces embeddings to be discriminative across writers,
-               acting as a strong regularizer against within-class collapse.
-Backbone     : stem + layer1 frozen; layer2-4 fine-tuned at 5e-5 (AdamW).
-               New modules (local_attn, projector, classifier) at 1e-4.
-Scheduler    : CosineAnnealingLR over 50 epochs → slow warm fade prevents
-               the pretrained layers from destabilising early.
-Grad clip    : max-norm 1.0 — stabilises the two-loss gradient mix.
+What changed from v1 (and why)
+--------------------------------
+ArcFace loss   : Replaces plain cross-entropy for writer classification.
+                 Adds an angular margin to the target class angle before softmax,
+                 forcing embeddings into tighter, more separated clusters per writer.
+                 This is the single biggest improvement for metric learning tasks.
+
+Stratified     : StratifiedPKSampler guarantees 4 CEDAR + 8 Dataset2 writers
+sampler          per batch instead of random uniform.  Fixes the 14:1 imbalance
+                 that was under-exposing CEDAR patterns.
+
+100 epochs     : Larger combined dataset needs more iterations to converge.
 
 Run
 ---
-  python train.py            # full 50-epoch run
+  python train.py            # full 100-epoch run (~4-5 hrs on T4 GPU)
   python train.py --sanity   # 1 epoch, 4 batches — smoke test
 """
 
@@ -37,7 +37,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from dataset import (build_cache, build_cache_dataset2,
-                     CombinedDataset, PKSampler,
+                     CombinedDataset, StratifiedPKSampler,
                      TRAIN_WRITERS, D2_TRAIN_WRITERS)
 from model   import SiameseNetwork
 
@@ -47,21 +47,31 @@ from model   import SiameseNetwork
 # ---------------------------------------------------------------------------
 
 EMBEDDING_DIM         = 512
-NUM_EPOCHS            = 50
+NUM_EPOCHS            = 100    # was 50 — larger dataset needs more iterations
+
 MARGIN                = 0.3    # cosine-distance triplet margin
-CE_WEIGHT             = 0.3    # weight for writer classification loss
+
+# ArcFace replaces plain cross-entropy for writer classification.
+# scale=30 is the standard for verification tasks; margin=0.35 ≈ 20 degrees.
+ARCFACE_SCALE         = 30.0
+ARCFACE_MARGIN        = 0.35
+ARCFACE_WEIGHT        = 0.3    # weight of ArcFace term in the total loss
 
 LR_BACKBONE           = 5e-5   # layer2-4 of both branches (pretrained, fine-tune slowly)
-LR_NEW                = 1e-4   # local_attn + projector + classifier (trained from scratch)
+LR_NEW                = 1e-4   # local_attn + projector + arcface (trained from scratch)
 WEIGHT_DECAY          = 1e-4
 GRAD_CLIP_NORM        = 1.0
 
 SEED                  = 42
 
-P                     = 12    # writers per batch (reduced from 16 to fit dual ResNet-50)
-K_GENUINE             = 4     # genuine images per writer per batch
-K_FORGERY             = 4     # forgery images per writer per batch
-NUM_BATCHES_PER_EPOCH = 125   # ~same epoch throughput as before (12*8*125 = 12000 imgs)
+# Stratified batch: 4 CEDAR + 8 Dataset2 writers per batch.
+# Keeps the total at 12 writers but gives CEDAR ~5x more exposure than
+# random sampling would (natural proportion was 1 CEDAR per 14 D2 writers).
+P_CEDAR               = 4
+P_D2                  = 8
+K_GENUINE             = 4      # genuine images per writer per batch
+K_FORGERY             = 4      # forgery images per writer per batch
+NUM_BATCHES_PER_EPOCH = 125
 
 CHECKPOINT_DIR        = "checkpoints"
 CACHE_DIR             = "cache"
@@ -69,7 +79,61 @@ NUM_WORKERS           = 0
 
 
 # ---------------------------------------------------------------------------
-# Triplet loss — all-pairs, same-writer forgeries only
+# ArcFace loss
+# ---------------------------------------------------------------------------
+
+class ArcFaceLoss(nn.Module):
+    """
+    Additive Angular Margin loss for writer classification.
+
+    How it works:
+      1. L2-normalise both the embedding vector and each class weight vector
+         so all lie on the unit sphere — the angle between them is meaningful.
+      2. Compute the angle θ between the embedding and its correct class weight.
+      3. Add the angular margin m to θ for the target class only, then scale
+         by s and apply softmax cross-entropy.
+
+    Effect: embeddings are pushed further from every decision boundary,
+    creating tighter intra-class clusters and wider inter-class gaps compared
+    to plain cross-entropy.  This is the primary improvement over v1.
+
+    Parameters
+    ----------
+    num_classes   : number of training writers (CEDAR + Dataset2 combined)
+    embedding_dim : size of L2-normalised output vector (512)
+    scale         : logit multiplier s — controls softmax sharpness (default 30)
+    margin        : angular margin m in radians (default 0.35 ≈ 20°)
+    """
+
+    def __init__(
+        self,
+        num_classes:   int,
+        embedding_dim: int,
+        scale:         float = 30.0,
+        margin:        float = 0.35,
+    ):
+        super().__init__()
+        self.scale  = scale
+        self.margin = margin
+        # Learnable class weight matrix — each row is a class centre on the unit sphere
+        self.weight = nn.Parameter(torch.empty(num_classes, embedding_dim))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        # Normalise class weights to unit sphere (embeddings already normalised by model)
+        w      = F.normalize(self.weight, p=2, dim=1)
+        cosine = torch.mm(embeddings, w.t()).clamp(-1 + 1e-7, 1 - 1e-7)
+
+        # Add angular margin m to target class angle, leave other classes unchanged
+        theta   = torch.acos(cosine)
+        one_hot = torch.zeros_like(cosine).scatter_(1, labels.unsqueeze(1), 1.0)
+        output  = torch.cos(theta + self.margin * one_hot) * self.scale
+
+        return F.cross_entropy(output, labels)
+
+
+# ---------------------------------------------------------------------------
+# Triplet loss — all-pairs, same-writer forgeries as negatives
 # ---------------------------------------------------------------------------
 
 def triplet_loss_allpairs(
@@ -80,8 +144,10 @@ def triplet_loss_allpairs(
 ) -> tuple:
     """
     All-pairs triplet loss using same-writer skilled forgeries as negatives.
-    For every genuine anchor, computes loss against every same-writer forgery.
-    Uses the hardest positive (furthest same-writer genuine) per anchor.
+    For every genuine anchor:
+      positive  = hardest same-writer genuine (furthest cosine distance)
+      negatives = all same-writer forgeries
+
     Returns (loss_scalar, n_active_triplets).
     """
     device  = embeddings.device
@@ -97,18 +163,17 @@ def triplet_loss_allpairs(
     same_w = wids.unsqueeze(0) == wids.unsqueeze(1)
     eye    = torch.eye(N, dtype=torch.bool, device=device)
 
-    # Hardest positive per anchor: same writer, both genuine, not self
+    # Hardest positive: same writer, both genuine, not self
     ap_mask = same_w & is_gen.unsqueeze(0) & is_gen.unsqueeze(1) & ~eye
-    d_ap = (dist * ap_mask.float()).sum(dim=1) / ap_mask.float().sum(dim=1).clamp(min=1)
-    has_pos = ap_mask.any(dim=1)
+    d_ap    = (dist * ap_mask.float()).sum(1) / ap_mask.float().sum(1).clamp(min=1)
+    has_pos = ap_mask.any(1)
 
-    # Same-writer skilled forgeries only
+    # Negatives: all same-writer forgeries
     an_mask = same_w & is_forg.unsqueeze(0)
-    has_neg = an_mask.any(dim=1)
+    has_neg = an_mask.any(1)
 
     anchor_valid = is_gen & has_pos & has_neg
-    d_ap_exp     = d_ap.unsqueeze(1).expand(N, N)
-    pair_loss    = F.relu(d_ap_exp - dist + margin)
+    pair_loss    = F.relu(d_ap.unsqueeze(1).expand(N, N) - dist + margin)
     valid        = anchor_valid.unsqueeze(1) & an_mask
 
     active     = pair_loss[valid]
@@ -129,12 +194,13 @@ def _save_loss_curve(epoch_losses: list, out_dir: str) -> None:
     best_idx = epoch_losses.index(min(epoch_losses))
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, epoch_losses, marker="o", linewidth=2,
-            markersize=4, color="steelblue", label="Training loss (triplet + CE)")
-    ax.scatter(best_idx + 1, epoch_losses[best_idx], color="red", zorder=5, s=80,
+    ax.plot(epochs, epoch_losses, marker="o", linewidth=2, markersize=3,
+            color="steelblue", label="Training loss (triplet + ArcFace)")
+    ax.scatter(best_idx + 1, epoch_losses[best_idx], color="red",
+               zorder=5, s=80,
                label=f"Best: epoch {best_idx+1}  ({epoch_losses[best_idx]:.4f})")
     ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("Loss", fontsize=12)
+    ax.set_ylabel("Loss",  fontsize=12)
     ax.set_title("Training Loss — Dual-Branch Signature Verification", fontsize=13)
     ax.legend(fontsize=11)
     ax.grid(True, linestyle="--", alpha=0.5)
@@ -142,11 +208,11 @@ def _save_loss_curve(epoch_losses: list, out_dir: str) -> None:
     path = os.path.join(out_dir, "loss_curve.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Loss curve saved -> {path}")
+    print(f"Loss curve saved → {path}")
 
 
 # ---------------------------------------------------------------------------
-# Main training function
+# Training
 # ---------------------------------------------------------------------------
 
 def train(sanity: bool = False) -> None:
@@ -156,38 +222,38 @@ def train(sanity: bool = False) -> None:
     print(f"Device          : {device}")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    # ----------------------------------------------------------------
-    # Cache
-    # ----------------------------------------------------------------
+    # ── Cache ────────────────────────────────────────────────────────────
     script_dir   = os.path.dirname(os.path.abspath(__file__))
     cache_dir    = os.path.join(script_dir, CACHE_DIR)
     dataset2_dir = os.path.join(script_dir, "dataset2")
-    print("Building CEDAR cache (skips existing files) …")
+
+    print("Building CEDAR cache (skips existing) …")
     build_cache(script_dir, cache_dir)
-    print("Building dataset2 cache (skips existing files) …")
+    print("Building Dataset2 cache (skips existing) …")
     build_cache_dataset2(dataset2_dir, cache_dir)
 
-    # ----------------------------------------------------------------
-    # Dataset / sampler / loader
-    # ----------------------------------------------------------------
+    # ── Dataset ───────────────────────────────────────────────────────────
     dataset = CombinedDataset(
         cache_dir,
         cedar_writers=TRAIN_WRITERS,
         d2_writers=D2_TRAIN_WRITERS,   # 650 writers; 651-686 held out for testing
         augment=(not sanity),
     )
-    # Build writer→label mapping for CE loss (IDs are non-contiguous with offset)
+
+    # Build writer → integer label map for ArcFace (IDs are non-contiguous after offset)
     all_train_writers = sorted(dataset.genuine_by_writer.keys())
     num_train_writers = len(all_train_writers)
     wid_to_label      = {wid: i for i, wid in enumerate(all_train_writers)}
 
-    num_batches = 4               if sanity else NUM_BATCHES_PER_EPOCH
-    epochs      = 1               if sanity else NUM_EPOCHS
-    pk_seed     = SEED            if sanity else None
+    num_batches = 4      if sanity else NUM_BATCHES_PER_EPOCH
+    epochs      = 1      if sanity else NUM_EPOCHS
+    pk_seed     = SEED   if sanity else None
 
-    sampler = PKSampler(
+    # ── Stratified sampler ────────────────────────────────────────────────
+    sampler = StratifiedPKSampler(
         dataset,
-        P=P, K_genuine=K_GENUINE, K_forgery=K_FORGERY,
+        P_cedar=P_CEDAR, P_d2=P_D2,
+        K_genuine=K_GENUINE, K_forgery=K_FORGERY,
         num_batches=num_batches,
         seed=pk_seed,
     )
@@ -202,26 +268,23 @@ def train(sanity: bool = False) -> None:
     print(f"Train writers   : {num_train_writers}  "
           f"(CEDAR {len(TRAIN_WRITERS)} + Dataset2 {len(D2_TRAIN_WRITERS)})  "
           f"({len(dataset)} images)")
-    print(f"Batch structure : P={P} writers x "
+    print(f"Batch structure : {P_CEDAR} CEDAR + {P_D2} D2 writers × "
           f"(K_gen={K_GENUINE} + K_forg={K_FORGERY}) = "
-          f"{P*(K_GENUINE+K_FORGERY)} imgs/batch")
-    print(f"Batches/epoch   : {num_batches}")
-    print(f"Epochs          : {epochs}")
-    print(f"Margin          : {MARGIN}  (cosine dist)   CE weight: {CE_WEIGHT}")
+          f"{(P_CEDAR + P_D2) * (K_GENUINE + K_FORGERY)} imgs/batch")
+    print(f"Batches/epoch   : {num_batches}    Epochs: {epochs}")
+    print(f"Triplet margin  : {MARGIN}   "
+          f"ArcFace: scale={ARCFACE_SCALE}  margin={ARCFACE_MARGIN}rad  "
+          f"weight={ARCFACE_WEIGHT}")
     print(f"Augmentation    : {'OFF (sanity)' if sanity else 'ON'}")
     if sanity:
         print("*** SANITY MODE — 1 epoch, 4 batches ***")
-    print("-" * 55)
+    print("-" * 60)
 
-    # ----------------------------------------------------------------
-    # Model
-    # ----------------------------------------------------------------
+    # ── Model ────────────────────────────────────────────────────────────
     model = SiameseNetwork(embedding_dim=EMBEDDING_DIM).to(device)
 
-    # Freeze stem (first conv + bn) and layer1 in both branches.
-    # These low-level texture detectors are already well-pretrained;
-    # updating them risks destabilising the HF detail channel in the
-    # early training phase.
+    # Freeze stem and layer1 in both branches (low-level pretrained features —
+    # updating them early risks destabilising the high-frequency detail channel)
     frozen_prefixes = (
         "sem_branch.stem", "sem_branch.layer1",
         "det_branch.stem", "det_branch.layer1",
@@ -232,20 +295,15 @@ def train(sanity: bool = False) -> None:
 
     n_total     = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable params: {n_trainable:,} / {n_total:,}  "
-          f"(stem+layer1 frozen in both branches)")
+    print(f"Trainable params: {n_trainable:,} / {n_total:,}  (stem+layer1 frozen)")
 
-    # ----------------------------------------------------------------
-    # Writer classification head (training only — not used at inference)
-    # ----------------------------------------------------------------
-    classifier = nn.Linear(EMBEDDING_DIM, num_train_writers).to(device)
+    # ── ArcFace head ─────────────────────────────────────────────────────
+    arcface = ArcFaceLoss(
+        num_train_writers, EMBEDDING_DIM, ARCFACE_SCALE, ARCFACE_MARGIN
+    ).to(device)
 
-    # ----------------------------------------------------------------
-    # Optimizer — differential LR
-    # ----------------------------------------------------------------
-    backbone_params = []   # pretrained layers 2-4 (fine-tune slowly)
-    new_params      = []   # local_attn + projector (train from scratch)
-
+    # ── Optimizer — differential learning rates ───────────────────────────
+    backbone_params, new_params = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -255,9 +313,9 @@ def train(sanity: bool = False) -> None:
             new_params.append(param)
 
     optimizer = torch.optim.AdamW([
-        {"params": backbone_params,           "lr": LR_BACKBONE},
-        {"params": new_params,                "lr": LR_NEW},
-        {"params": classifier.parameters(),   "lr": LR_NEW},
+        {"params": backbone_params,      "lr": LR_BACKBONE},  # ResNet layers 2-4
+        {"params": new_params,           "lr": LR_NEW},       # attention + projector
+        {"params": arcface.parameters(), "lr": LR_NEW},       # ArcFace class weights
     ], weight_decay=WEIGHT_DECAY)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -266,34 +324,33 @@ def train(sanity: bool = False) -> None:
 
     print(f"LR backbone(layer2-4): {LR_BACKBONE}   LR new modules: {LR_NEW}")
     print(f"Scheduler: CosineAnnealingLR  T_max={epochs}  eta_min=1e-6")
-    print("-" * 55)
+    print("-" * 60)
 
-    # ----------------------------------------------------------------
-    # Training log
-    # ----------------------------------------------------------------
-    log_path = os.path.join(CHECKPOINT_DIR, "training_log.txt")
-    log_file = open(log_path, "a", encoding="utf-8")
+    # ── Training log ─────────────────────────────────────────────────────
+    log_path  = os.path.join(CHECKPOINT_DIR, "training_log.txt")
+    log_file  = open(log_path, "a", encoding="utf-8")
     run_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_file.write(
         f"\n--- Run started {run_start}  "
-        f"(dual-branch ResNet50, emb={EMBEDDING_DIM}, margin={MARGIN}, "
-        f"ce_weight={CE_WEIGHT}, lr_backbone={LR_BACKBONE}, lr_new={LR_NEW}, "
-        f"wd={WEIGHT_DECAY}, P={P}, K_gen={K_GENUINE}, K_forg={K_FORGERY}, "
+        f"(dual-branch ResNet50, emb={EMBEDDING_DIM}, "
+        f"triplet margin={MARGIN}, "
+        f"arcface scale={ARCFACE_SCALE} margin={ARCFACE_MARGIN} weight={ARCFACE_WEIGHT}, "
+        f"lr_backbone={LR_BACKBONE}, lr_new={LR_NEW}, wd={WEIGHT_DECAY}, "
+        f"P_cedar={P_CEDAR}, P_d2={P_D2}, K_gen={K_GENUINE}, K_forg={K_FORGERY}, "
         f"epochs={epochs}, batches/epoch={num_batches}, "
-        f"writers={num_train_writers} (CEDAR {len(TRAIN_WRITERS)} + D2 {len(D2_TRAIN_WRITERS)})"
+        f"writers={num_train_writers} "
+        f"(CEDAR {len(TRAIN_WRITERS)} + D2 {len(D2_TRAIN_WRITERS)})"
         f"{'  SANITY' if sanity else ''}) ---\n"
     )
     log_file.flush()
 
-    # ----------------------------------------------------------------
-    # Training loop
-    # ----------------------------------------------------------------
+    # ── Training loop ────────────────────────────────────────────────────
     epoch_losses = []
     best_loss    = float("inf")
 
     for epoch in range(1, epochs + 1):
         model.train()
-        classifier.train()
+        arcface.train()
         running_loss     = 0.0
         running_triplets = 0
         n_valid_batches  = 0
@@ -301,18 +358,15 @@ def train(sanity: bool = False) -> None:
 
         for imgs, writer_ids, is_genuine in loader:
             imgs = imgs.to(device)
+            embs = model._embed(imgs)   # [B, 512], L2-normalised
 
-            embs = model._embed(imgs)   # [B, 512]
-
-            # --- Triplet loss ---
+            # Triplet loss — metric learning between genuine / forgery pairs
             trip_loss, n_trip = triplet_loss_allpairs(
-                embs,
-                writer_ids.tolist(),
-                is_genuine.tolist(),
-                margin=MARGIN,
+                embs, writer_ids.tolist(), is_genuine.tolist(), margin=MARGIN,
             )
 
-            # --- Writer classification loss (genuine images only) ---
+            # ArcFace loss — writer discrimination (genuine images only)
+            # Forgeries are excluded because they don't have a stable class identity
             gen_mask = is_genuine.bool()
             if gen_mask.sum() > 0:
                 gen_embs = embs[gen_mask]
@@ -320,20 +374,19 @@ def train(sanity: bool = False) -> None:
                     [wid_to_label[int(w)] for w in writer_ids[gen_mask]],
                     dtype=torch.long, device=device,
                 )
-                logits   = classifier(gen_embs)
-                ce_loss  = F.cross_entropy(logits, gen_wids)
+                arc_loss = arcface(gen_embs, gen_wids)
             else:
-                ce_loss = embs.sum() * 0.0
+                arc_loss = embs.sum() * 0.0
 
             if n_trip == 0:
                 continue
 
-            total_loss = trip_loss + CE_WEIGHT * ce_loss
+            total_loss = trip_loss + ARCFACE_WEIGHT * arc_loss
 
             optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(classifier.parameters()),
+                list(model.parameters()) + list(arcface.parameters()),
                 GRAD_CLIP_NORM,
             )
             optimizer.step()
@@ -343,7 +396,7 @@ def train(sanity: bool = False) -> None:
             n_valid_batches  += 1
 
         if n_valid_batches == 0:
-            print(f"WARNING epoch {epoch}: zero valid triplets — check PKSampler.")
+            print(f"WARNING epoch {epoch}: zero valid triplets — check sampler.")
             continue
 
         epoch_loss = running_loss / n_valid_batches
@@ -353,7 +406,7 @@ def train(sanity: bool = False) -> None:
         epoch_losses.append(epoch_loss)
 
         print(
-            f"Epoch [{epoch:2d}/{epochs}]  "
+            f"Epoch [{epoch:3d}/{epochs}]  "
             f"Loss: {epoch_loss:.6f}  "
             f"Triplets: {running_triplets:,}  "
             f"LR: {current_lr:.2e}  "
@@ -364,50 +417,51 @@ def train(sanity: bool = False) -> None:
             remaining = duration * (epochs - 1)
             print(f"  --> Est. remaining: {remaining/60:.1f} min  "
                   f"({remaining/3600:.2f} hr)")
-            if epoch_loss < 0.005:
+            # With ArcFace(scale=30) the combined loss starts around 3-6.
+            # A value below 0.1 after epoch 1 means triplet collapsed.
+            if epoch_loss < 0.1:
                 print(
-                    f"\n  *** COLLAPSE WARNING: epoch-1 loss = {epoch_loss:.6f}.  "
-                    f"Expected 0.05–0.40 for a healthy dual-branch run. ***\n"
+                    f"\n  *** COLLAPSE WARNING: epoch-1 loss = {epoch_loss:.6f}. "
+                    f"Expected 3.0–6.0 for a healthy ArcFace run. ***\n"
                 )
 
         log_file.write(
-            f"{ts}  Epoch {epoch:2d}/{epochs}  Loss: {epoch_loss:.6f}  "
+            f"{ts}  Epoch {epoch:3d}/{epochs}  Loss: {epoch_loss:.6f}  "
             f"Triplets: {running_triplets}  Duration: {duration:.1f}s  "
             f"LR: {current_lr:.2e}\n"
         )
         log_file.flush()
 
-        # Full checkpoint (includes optimizer + classifier for resumability)
-        ckpt_path = os.path.join(CHECKPOINT_DIR, f"siamese_epoch_{epoch:02d}.pt")
+        # Full checkpoint (model + arcface + optimizer — allows resuming)
+        ckpt_path = os.path.join(CHECKPOINT_DIR, f"siamese_epoch_{epoch:03d}.pt")
         torch.save(
             {
-                "epoch"                : epoch,
-                "model_state_dict"     : model.state_dict(),
-                "classifier_state_dict": classifier.state_dict(),
-                "optim_state_dict"     : optimizer.state_dict(),
-                "loss"                 : epoch_loss,
-                "margin"               : MARGIN,
-                "embedding_dim"        : EMBEDDING_DIM,
+                "epoch"              : epoch,
+                "model_state_dict"   : model.state_dict(),
+                "arcface_state_dict" : arcface.state_dict(),
+                "optim_state_dict"   : optimizer.state_dict(),
+                "loss"               : epoch_loss,
+                "margin"             : MARGIN,
+                "arcface_scale"      : ARCFACE_SCALE,
+                "arcface_margin"     : ARCFACE_MARGIN,
+                "embedding_dim"      : EMBEDDING_DIM,
             },
             ckpt_path,
         )
 
         if epoch_loss < best_loss:
             best_loss = epoch_loss
-            torch.save(model.state_dict(),
-                       os.path.join(CHECKPOINT_DIR, "best.pt"))
+            torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best.pt"))
             print(f"  --> New best saved  (loss: {best_loss:.6f})")
 
         scheduler.step()
 
-    # ----------------------------------------------------------------
-    # Post-training
-    # ----------------------------------------------------------------
+    # ── Post-training ────────────────────────────────────────────────────
     torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "final.pt"))
     log_file.write(f"--- Training complete.  Best loss: {best_loss:.6f} ---\n")
     log_file.close()
 
-    print("-" * 55)
+    print("-" * 60)
     print(f"Training complete.  Best loss: {best_loss:.6f}")
     print(f"Checkpoints: ./{CHECKPOINT_DIR}/")
 

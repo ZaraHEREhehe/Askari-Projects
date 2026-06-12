@@ -207,6 +207,60 @@ class PKSampler(Sampler):
 
 
 # ---------------------------------------------------------------------------
+# Stratified batch sampler  (fixes CEDAR / Dataset2 class imbalance)
+# ---------------------------------------------------------------------------
+
+class StratifiedPKSampler(Sampler):
+    """
+    Samples P_cedar CEDAR writers and P_d2 Dataset2 writers every batch.
+
+    Without this, a plain random sampler over 695 writers gives only ~0.8
+    CEDAR writers per batch (14:1 skew toward Dataset2).  Fixing this to
+    a 4:8 ratio gives CEDAR ~5x more exposure than its natural proportion,
+    so the model learns CEDAR patterns properly without losing Dataset2
+    diversity.
+
+    Writers are identified by ID: CEDAR IDs < D2_WRITER_OFFSET, Dataset2 IDs >= offset.
+    """
+
+    def __init__(
+        self,
+        dataset:     CombinedDataset,
+        P_cedar:     int = 4,
+        P_d2:        int = 8,
+        K_genuine:   int = 4,
+        K_forgery:   int = 4,
+        num_batches: int = 125,
+        seed:        int = None,
+    ):
+        self.dataset     = dataset
+        self.P_cedar     = P_cedar
+        self.P_d2        = P_d2
+        self.K_genuine   = K_genuine
+        self.K_forgery   = K_forgery
+        self.num_batches = num_batches
+        self.seed        = seed
+
+        all_writers = list(dataset.genuine_by_writer.keys())
+        self.cedar_writers = [w for w in all_writers if w <  D2_WRITER_OFFSET]
+        self.d2_writers    = [w for w in all_writers if w >= D2_WRITER_OFFSET]
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    def __iter__(self):
+        rng = random.Random(self.seed)
+        for _ in range(self.num_batches):
+            cedar = rng.sample(self.cedar_writers, min(self.P_cedar, len(self.cedar_writers)))
+            d2    = rng.sample(self.d2_writers,    min(self.P_d2,    len(self.d2_writers)))
+            indices = []
+            for wid in cedar + d2:
+                indices += rng.choices(self.dataset.genuine_by_writer[wid], k=self.K_genuine)
+                indices += rng.choices(self.dataset.forgery_by_writer[wid], k=self.K_forgery)
+            yield indices
+
+
+# ---------------------------------------------------------------------------
 # Dataset2 cache builder
 # ---------------------------------------------------------------------------
 
