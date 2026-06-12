@@ -457,7 +457,8 @@ def evaluate(checkpoint_path: str = DEFAULT_CKPT) -> list:
       1. Load model
       2. Score CEDAR test writers 46-55
       3. Score Dataset2 test writers 651-686
-      4. Print side-by-side summary with banking operating points
+      4. Score combined (CEDAR + Dataset2 merged)
+      5. Print side-by-side summary with banking operating points
 
     Returns the list of result dicts (useful when called from a notebook).
     """
@@ -487,8 +488,18 @@ def evaluate(checkpoint_path: str = DEFAULT_CKPT) -> list:
         all_results.append(
             _evaluate_one("Dataset2", d2_gen, d2_forg, model, device, plots_dir)
         )
+
+        # ── Combined (CEDAR + Dataset2 merged) ───────────────────────────
+        # Merges all test pairs from both datasets into one pool.
+        # Gives a single headline number that reflects overall generalisation
+        # across both signature styles — the most representative of real-world use.
+        combined_gen  = cedar_gen  + d2_gen
+        combined_forg = cedar_forg + d2_forg
+        all_results.append(
+            _evaluate_one("Combined", combined_gen, combined_forg, model, device, plots_dir)
+        )
     else:
-        print("\n  Dataset2 test cache not found — skipping D2 evaluation.")
+        print("\n  Dataset2 test cache not found — skipping D2 and Combined evaluation.")
         print("  (Run build_cache_dataset2 first, then re-evaluate.)")
 
     _print_summary(all_results)
